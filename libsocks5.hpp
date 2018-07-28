@@ -11,8 +11,8 @@
 /// then calling its run() method to start serving clients.
 
 #ifndef _WIN32
-#include <sys/socket.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
 #else
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -103,7 +103,7 @@ constexpr Verbosity verbosity_info = Verbosity{2};
 constexpr Verbosity verbosity_debug = Verbosity{3};
 
 /// socks5 server settings. If you do not customize the settings when creating
-/// a Client, the defaults listed below will be used instead.
+/// a Server, the defaults listed below will be used instead.
 class Settings {
  public:
   /// Hint on number of threads to use. The actual number will be three times
@@ -133,7 +133,7 @@ class Server {
      objective is to keep the code simple such that we can easily apply
      changes when our measurement requirements change. Hence, the choice
      of using threading rather than asynchronous API, e.g. libuv.
-     
+
      The main use case of this library is to act as a middle man between
      OONI's WebConnectivity and the network, to be able to capture
      interesting stuff, like network errors etc. It can actually also
@@ -172,13 +172,10 @@ class Server {
   /// the same used by the C++ >= 11 standard library inside of the std::errc
   /// enum class. @see <https://en.cppreference.com/w/cpp/error/errc> for a
   /// mapping between such values and POSIX error codes. @remark You can use
-  /// this method map any negative return value in the callbacks that are
-  /// called when tracing is enabled via Settings, provided that the return
-  /// value is negative. @remark This function does not know the meaning
-  /// of zero or positive values, which depends on the API that was called,
-  /// hence you should only pass it negative values: zero or positive
-  /// values are going to be mapped to "io_error" as they are unknown and
-  /// "io_error" is the catch all error code.
+  /// this method to map any _negative_ return value in the callbacks that are
+  /// called when tracing is enabled via Settings. Do not pass zero or positive
+  /// values; this function does not know their semantics, which depends on the
+  /// specific API. Zero or positive values will map to "io_error".
   std::string errno_to_string(int64_t return_value) noexcept;
 
   /// Called after connect when trace is enabled. Tracing will only trace
@@ -208,33 +205,37 @@ class Server {
 
   /// Called only once if and only if we identify a SSL >= 3 record containing
   /// the certificates. The buffer that you're provided with contains the
-  /// record body only (i.e. we omit the five bytes fixed size header that
-  /// was stripped as part of processing the TLS stream.)
+  /// full TLS record that contains the certificate. We currently use a fixed
+  /// size buffer for sniffing TLS. However the buffer should be big enough
+  /// that in most cases the certificates won't be truncated. @remark in case
+  /// of truncation this method will not be called.
   virtual void on_tls_handshake_cert(std::string record) noexcept;
 
- protected:
-  // Handles a warning log message.
+  /// Handles a warning log message.
   virtual void on_warning(std::string message) noexcept;
 
-  // Handles a info log message.
+  /// Handles a info log message.
   virtual void on_info(std::string message) noexcept;
 
-  // Handles a debug log message.
+  /// Handles a debug log message.
   virtual void on_debug(std::string message) noexcept;
 
+  // You probably don't want to override these methods unless you are into
+  // heavy customization or you're writing regress tests.
+ protected:
 #ifdef LIBSOCKS5_HAVE_GETDNS
   // Like so_resolve_hostname() but using the getdns backend.
   virtual int so_resolve_hostname_getdns(
-        std::string hostname, std::vector<std::string> *addresses) noexcept;
+      std::string hostname, std::vector<std::string> *addresses) noexcept;
 #endif  // LIBSOCKS5_HAVE_GETDNS
 
   // Resolve @p hostname into a list of @p addresses. @return 0 on success.
   virtual int so_resolve_hostname(std::string hostname,
-                std::vector<std::string> *addresses) noexcept;
+                                  std::vector<std::string> *addresses) noexcept;
 
   // Overridable wrapper for getaddrinfo(). @return 0 on success.
   virtual int so_getaddrinfo(const char *hostname, const char *servname,
-                const addrinfo *hints, addrinfo **rp) noexcept;
+                             const addrinfo *hints, addrinfo **rp) noexcept;
 
   // Overridable wrapper for freeaddrinfo().
   virtual void so_freeaddrinfo(addrinfo *rp) noexcept;
@@ -250,11 +251,11 @@ class Server {
 
   // Overridable wrapper for bind(). @return 0 on success.
   virtual int so_bind(int64_t fd, const sockaddr *sa,
-                    socklen_t len) noexcept;
+                      socklen_t len) noexcept;
 
   // Overridable wrapper for connect(). @return 0 on success.
   virtual int so_connect(int64_t fd, const sockaddr *sa,
-                    socklen_t len) noexcept;
+                         socklen_t len) noexcept;
 
   // Overridable wrapper for poll(). @return 0 on success, negative on error. A
   // timeout is always reported as an error. The number of active sockets is not
@@ -278,11 +279,11 @@ class Server {
 
   // Overridable wrapper for getsockopt(). @return 0 on success.
   virtual int so_getsockopt(int64_t fd, int level, int option_name,
-                    char *option_value, socklen_t *option_len) noexcept;
+                            char *option_value, socklen_t *option_len) noexcept;
 
   // Overridable wrapper for setsockopt(). @return 0 on success.
   virtual int so_setsockopt(int64_t fd, int level, int option_name,
-                    char *option_value, socklen_t option_len) noexcept;
+                            char *option_value, socklen_t option_len) noexcept;
 
   // Nonblocking recv. @return size on success, zero on EOF, negative on error.
   virtual int64_t so_recv_nonblock(int64_t fd, char *p, uint64_t n) noexcept;
@@ -295,7 +296,7 @@ class Server {
 
   // Nonblocking send. @return size on success, zero on EOF, negative on error.
   virtual int64_t so_send_nonblock(int64_t fd, const char *p,
-                        uint64_t n) noexcept;
+                                   uint64_t n) noexcept;
 
   // Blocking send. @return size on success, zero on EOF, negative on error.
   virtual int64_t so_send(int64_t fd, const char *p, uint64_t n) noexcept;
@@ -321,7 +322,7 @@ class Server {
 };
 
 // Define this macro if you need to include this file in multiple translation
-// units such that symbols will not be any duplicated symbols.
+// units such that symbols will not be duplicated.
 #ifndef LIBSOCKS5_NO_INLINE_IMPL
 
 #define EMIT_LOG(level, stmts)                           \
@@ -399,6 +400,7 @@ bool Server::run() noexcept {
       }
     }
     EMIT_DEBUG("run: bound to endpoint");
+    // We may actually end up adding more options than required. Not an issue.
     if (so_setoptions_common_quick(listenfd) != 0) {
       EMIT_WARNING("run: so_setoptions_common_quick() failed");
       (void)so_closesocket(listenfd);
@@ -450,6 +452,8 @@ bool Server::run() noexcept {
     {
       std::unique_lock<std::mutex> _{impl->mutex};
       if (impl->queue.size() > 0) {
+        // Reasoning: rather than having the queue build up it's probably
+        // best to kill the connections we cannot serve _pronto_.
         EMIT_DEBUG("closing socket " << clientfd << ": queue is building up");
         (void)so_closesocket(clientfd);
         continue;
@@ -466,25 +470,25 @@ bool Server::run() noexcept {
 }
 
 void Server::interrupt() noexcept {
-  impl->interrupted = false;
-  impl->cond.notify_all();  // more efficient if unlocked
+  impl->interrupted = true;  // atomic
+  impl->cond.notify_all();   // more efficient if unlocked
 }
 
-static std::string   //
+static std::string  //
 sockaddr_to_string(const sockaddr *sa, socklen_t salen) noexcept {
   std::stringstream ss;
   ss << "sockaddr{";
   char buf[46];  // See <https://stackoverflow.com/a/1076755>
   if (salen == sizeof(sockaddr_in)) {
     ss << "\"";
-    if (inet_ntop(AF_INET, sa, buf, sizeof (buf)) != nullptr) {
+    if (inet_ntop(AF_INET, sa, buf, sizeof(buf)) != nullptr) {
       ss << buf;
     }
     ss << "\", ";
     ss << std::to_string(ntohs(((sockaddr_in *)sa)->sin_port));
   } else if (salen == sizeof(sockaddr_in6)) {
     ss << "\", ";
-    if (inet_ntop(AF_INET6, sa, buf, sizeof (buf)) != nullptr) {
+    if (inet_ntop(AF_INET6, sa, buf, sizeof(buf)) != nullptr) {
       ss << buf;
     }
     ss << "\", ";
@@ -519,7 +523,11 @@ static std::string buffer_to_string(const char *buf, uint64_t total) noexcept {
 }
 
 std::string Server::errno_to_string(int64_t return_value) noexcept {
+  assert(return_value < 0);  // See the documentation
   // clang-format off
+  // As you'll probably see below, we conflate several nonbocking status
+  // codes into -EAGAIN. And anyway the user should not see -EAGAIN, so
+  // do not ever bother to add a case for it.
   switch (return_value) {
     case -EPIPE: return "broken_pipe";
     case -ECONNABORTED: return "connection_aborted";
@@ -566,12 +574,15 @@ void Server::on_closesocket(int64_t sock, int return_value) noexcept {
 #ifdef LIBSOCKS5_HAVE_GETDNS
 class CharStarDeleter {
  public:
+  // Implementation note: not all free() implementations handle `nullptr`
   void operator()(char *ptr) noexcept { if (ptr) ::free(ptr); }
 };
 using UniqueCharStar = std::unique_ptr<char, CharStarDeleter>;
 
 void Server::on_getdns_success(getdns_dict *reply) noexcept {
   UniqueCharStar string_scope;
+  // The returned string must be deleted with free() unless the default malloc
+  // function has been replaced. See getdns documentation for more.
   auto s = getdns_pretty_print_dict(reply);
   string_scope.reset(s);
   EMIT_INFO(s);
@@ -732,17 +743,19 @@ int Server::so_resolve_hostname(
     auto rv = so_resolve_hostname_getdns(hostname, addresses);
     if (rv == 0) return rv;
     if ((impl->settings.options & option_dns_fallback) == 0) return rv;
-    EMIT_DEBUG("resolve_hostname: getdns failed; falling back to getaddrinfo");
 #else
     EMIT_WARNING("resolve_hostname: getdns support not compiled in");
-    return -ENOTSUP;
+    if ((impl->settings.options & option_dns_fallback) == 0) return -ENOTSUP;
 #endif  // LIBSOCKS5_HAVE_GETDNS
+    EMIT_DEBUG("resolve_hostname: getdns failed; falling back to getaddrinfo");
   }
   EMIT_DEBUG("resolve_hostname: using getaddrinfo to resolve: " << hostname);
   addrinfo hints{};
   hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags |= AI_NUMERICSERV;
   hints.ai_family = AF_UNSPEC;
   addrinfo *rp = nullptr;
+  // Implementation note: any port would be okay in this context.
   if (so_getaddrinfo(hostname.data(), "80", &hints, &rp) != 0) return -ENOENT;
   assert(rp != nullptr);
   for (auto ai = rp; ai != nullptr; ai = ai->ai_next) {
@@ -771,6 +784,8 @@ int64_t Server::so_socket(int domain, int type, int protocol) noexcept {
   return (int64_t)::socket(domain, type, protocol);
 }
 
+// This function is "quick" because it performs less checks than needed and it
+// should generally be used only right after a socket has been created.
 int Server::so_setoptions_common_quick(int64_t fd) noexcept {
 #ifdef _WIN32
   unsigned long enable = 1;
@@ -790,7 +805,10 @@ int Server::so_setoptions_common_quick(int64_t fd) noexcept {
 }
 
 int Server::so_closesocket(int64_t fd) noexcept {
-  // TODO(bassosimone): consider the possibility of using SO_LINGER
+  // TODO(bassosimone): consider the possibility of using SO_LINGER. This could
+  // be a way to avoid the problem of "dirty shutdowns" (i.e. the fact that
+  // control messages are not authenticated in TCP hence a malicious actor can
+  // inject a FIN or RST into the flow thus terminating the connection).
 #ifdef _WIN32
   return ::closesocket(fd) != 0 ? -EIO : 0;
 #else
@@ -866,7 +884,10 @@ int Server::so_connect(int64_t fd, const sockaddr *sa, socklen_t len) noexcept {
 }
 
 int Server::so_poll(pollfd *fds, uint64_t nfds, int milli) noexcept {
-  if (nfds > USHRT_MAX) return -EOVERFLOW;  // Arbitrary limit
+  // Arbitrarily limit nfds to a very small value and later force a cast so we
+  // don't have to do effort to consider Win32/Unix real sizes. We're not going
+  // to have more than a bunch of sockets to poll anyway.
+  if (nfds > USHRT_MAX) return -EOVERFLOW;
 #ifdef _WIN32
   auto rv = ::WSAPoll(fds, (unsigned short)nfds, milli);
 #else
@@ -898,13 +919,17 @@ int Server::so_wait_readable(int64_t fd, int milli) noexcept {
 int Server::so_getsockopt(int64_t fd, int level, int option_name,
                           char *option_value, socklen_t *option_len) noexcept {
   return ::getsockopt(fd, level, option_name,
-                option_value, option_len) != 0 ? -EIO : 0;
+                      option_value, option_len) != 0
+             ? -EIO
+             : 0;
 }
 
 int Server::so_setsockopt(int64_t fd, int level, int option_name,
                           char *option_value, socklen_t option_len) noexcept {
   return ::setsockopt(fd, level, option_name,
-                option_value, option_len) != 0 ? -EIO : 0;
+                      option_value, option_len) != 0
+             ? -EIO
+             : 0;
 }
 
 int64_t Server::so_recv_nonblock(int64_t fd, char *p, uint64_t n) noexcept {
@@ -913,6 +938,9 @@ int64_t Server::so_recv_nonblock(int64_t fd, char *p, uint64_t n) noexcept {
   return (rv < 0) ? get_last_error() : (int64_t)rv;
 }
 
+// Curiosity: in libndt I use a proactive pattern because it avoids waiting
+// when you're receiving in a loop. Here speed matters less, so use a reactive
+// pattern because it's simpler and easier to read.
 int64_t Server::so_recv(int64_t fd, char *p, uint64_t n) noexcept {
   auto r = (int64_t)so_wait_readable(fd, impl->settings.timeout_millisecond);
   if (r == 0) r = so_recv_nonblock(fd, p, n);
@@ -935,13 +963,18 @@ int64_t Server::so_recvn(int64_t fd, char *p, uint64_t n) noexcept {
 int64_t Server::so_send_nonblock(int64_t fd, const char *p,
                                  uint64_t n) noexcept {
   if (n > INT_MAX) return -EOVERFLOW;  // Limitation on Windows
-#ifdef MSG_NOSIGNAL
+#ifdef MSG_NOSIGNAL                    // Linux trick to avoid SIGPIPE
   auto rv = ::send(fd, p, (unsigned int)n, MSG_NOSIGNAL);
 #else
   auto rv = ::send(fd, p, (unsigned int)n, 0);
 #endif
   return (rv < 0) ? get_last_error() : (int64_t)rv;
 }
+
+// Make sure we do not compile if we cannot ignore SIGPIPE
+#if !defined _WIN32 && !defined SO_NOSIGPIPE && !defined MSG_NOSIGNAL
+#error "No way to avoid SIGPIPE on your system. Damn."
+#endif  // Not Windows, not BSD, not Linux.
 
 int64_t Server::so_send(int64_t fd, const char *p, uint64_t n) noexcept {
   auto r = (int64_t)so_wait_writeable(fd, impl->settings.timeout_millisecond);
@@ -1042,7 +1075,7 @@ int Server::socks5h_dispatch(int64_t clientfd) noexcept {
     if (header[3] != 0x03) {
       EMIT_WARNING("socks5h_dispatch: unsupported address type: "
                    << (uint64_t)header[3]);
-      return -EIO;
+      return -ENOTSUP;
     }
     EMIT_DEBUG("socks5h_dispatch: successfully read connect request header");
   }
@@ -1149,7 +1182,7 @@ int Server::socks5h_dispatch(int64_t clientfd) noexcept {
         }
         if ((impl->settings.options & option_trace) != 0) {
           on_connect(fd, ai->ai_addr, ai->ai_addrlen,
-                  (soerr) ? map_last_error(soerr) : 0);
+                     (soerr) ? map_last_error(soerr) : 0);
         }
         if (soerr == 0) {
           EMIT_DEBUG("socks5h_dispatch: we successfully connected to "
@@ -1199,16 +1232,17 @@ int Server::socks5h_dispatch(int64_t clientfd) noexcept {
     std::atomic<uint64_t> active{2};
     constexpr uint8_t trace_receive = (1 << 0);
     constexpr uint8_t trace_send = (1 << 1);
-    auto forward = [&active, this](  //
-            uint64_t source, uint64_t sink, uint8_t trace) noexcept {
+    auto forward = [&active, this ](  //
+        uint64_t source, uint64_t sink, uint8_t trace) noexcept {
       char buffer[131072];
-      constexpr uint64_t tls_snap_size = 262144;  // TODO: is this reasonable?
+      constexpr uint64_t tls_snap_size = 262144;  // TODO(bassosimone): ok?
       std::string tls_stream;
       while (!impl->interrupted) {
-        auto n = so_recv(source, buffer, sizeof (buffer));
+        auto n = so_recv(source, buffer, sizeof(buffer));
         if ((trace & trace_receive) != 0) {
-          on_recv(source, buffer, sizeof (buffer), n);
-          if (n >= 0 && tls_stream.size() < tls_snap_size) {
+          on_recv(source, buffer, sizeof(buffer), n);
+          if (n > 0 && tls_stream.size() < tls_snap_size) {
+            // The snap size is not enforced strictly. It doesn't matter.
             tls_stream += std::string{buffer, (uint64_t)n};
             if (tls_stream.size() >= tls_snap_size) decode_tls(tls_stream);
           }
@@ -1222,7 +1256,7 @@ int Server::socks5h_dispatch(int64_t clientfd) noexcept {
         if (n <= 0) break;
       }
       if ((trace & trace_receive) != 0 &&
-              tls_stream.size() < tls_snap_size) decode_tls(tls_stream);
+          tls_stream.size() < tls_snap_size) decode_tls(tls_stream);
       active -= 1;
     };
     // clang-format off
@@ -1235,6 +1269,35 @@ int Server::socks5h_dispatch(int64_t clientfd) noexcept {
         (impl->settings.options & option_trace) != 0 ? trace_receive : 0
     }.detach();
     // clang-format on
+    /*-
+     * Art by Marcin Glinski
+     *                                            _.gd8888888bp._
+     *                                         .g88888888888888888p.
+     *                                       .d8888P""       ""Y8888b.
+     *                                       "Y8P"               "Y8P'
+     *                                          `.               ,'
+     *                                            \     .-.     /
+     *                                             \   (___)   /
+     *  .------------------._______________________:__________j
+     * /                   |                      |           |`-.,_
+     * \###################|######################|###########|,-'`
+     *  `------------------'                       :    ___   l
+     *                                             /   (   )   \
+     *                                    fsc     /     `-'     \
+     *                                          ,'               `.
+     *                                       .d8b.               .d8b.
+     *                                       "Y8888p..       ,.d8888P"
+     *                                         "Y88888888888888888P"
+     *                                            ""YY8888888PP""
+     *
+     * This is meant to say: I know the code below is not a fancy solution but
+     * I don't care because it's simple, does its job, and does not consume
+     * resources. (Yeah, you can argue that on mobile this isn't good and on
+     * that I concur, but the plan is to shutdown most if not all the C++ code
+     * in the OONI app when it's not running tests ¯\_(ツ)_/¯).
+     *
+     *              [Art source: <https://www.asciiart.eu/weapons/axes>.]
+     */
     while (active > 0) {
       std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
@@ -1249,7 +1312,7 @@ int Server::socks5h_dispatch(int64_t clientfd) noexcept {
 void Server::decode_tls(const std::string &data) noexcept {
   // See <https://www.cisco.com/c/en/us/support/docs/security-vpn/secure-socket-layer-ssl/116181-technote-product-00.html>
   //
-  // Note that according to the above source Microsoft is know to violate the
+  // Note that according to the above source Microsoft is known to violate the
   // maximum record length ((1 << 14) -1) thus we don't enforce limits.
   //
   // Decoding of protocols older than SSLv3 is not implemented.
@@ -1285,7 +1348,7 @@ void Server::decode_tls(const std::string &data) noexcept {
       record += std::string{base, len};  //
       if (base[0] == 0x0b) {             // Search for certificate
         on_tls_handshake_cert(record);   //
-        return;                          //
+        return;                          // Final state!
       }                                  //
       if ((uintptr_t)base >              // Skip the fixed body
           UINTPTR_MAX - len) return;     //
