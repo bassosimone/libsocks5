@@ -84,8 +84,19 @@ constexpr Options option_getdns = Options{1 << 0};
 constexpr Options option_dns_fallback = Options{1 << 1};
 
 /// Trace connect(), send(), recv(), and close() calls that occur on the
-/// socket that is directly connected to the remote host.
+/// socket that is directly connected to the remote host. Note that setting
+/// just this bit will not enable TLS tracing with MUST be additionally
+/// enabled by setting the option_trace_tls flag.
 constexpr Options option_trace = Options{1 << 2};
+
+/// When tracing is enabled also trace the TLS conversation. Because of
+/// TLSv1.3, tracing the TLS conversation does not allow one to obtain the
+/// certificate presented by the server, which is now encrypted. So, the
+/// correct way to proceed is most likely to use functionality inside the
+/// of the application (e.g. cURL) to obtain the certificate. Yet, with
+/// lower versions of TLS, this functionality MAY still be useful both to
+/// observe the certificate as well as maybe other control packets.
+constexpr Options option_trace_tls = Options{1 << 3};
 
 /// How much verbose must the library be.
 using Verbosity = unsigned int;
@@ -125,7 +136,30 @@ class Settings {
   Verbosity verbosity = verbosity_quiet;
 };
 
-/// Socks5 server.
+/// Enumerates the direction of a TlsRecord.
+enum class TlsDirection {
+  /// The direction is invalid.
+  invalid,
+  /// The record is travelling from the client to the server.
+  client_to_server,
+  /// The record is travelling from the server to the client.
+  server_to_client
+};
+
+/// Reassembled TLS record.
+class TlsRecord {
+ public:
+  /// Direction of this record.
+  TlsDirection direction;
+  /// Data contained within this record.
+  std::string data;
+};
+
+/// Socks5 server. This class has several callbacks that are called when
+/// specific events occur. You could override these callbacks to change the
+/// default behaviour, which is to log the event. @warning Because we use
+/// many worker threads, callbacks will most likely be called from another
+/// thread context, so make sure you properly implement locking.
 class Server {
  public:
   /* Implementation note: this is not meant to be a fancy low-overhead
@@ -203,13 +237,9 @@ class Server {
   virtual void on_getdns_success(getdns_dict *reply) noexcept;
 #endif  // LIBSOCKS5_HAVE_GETDNS
 
-  /// Called only once if and only if we identify a SSL >= 3 record containing
-  /// the certificates. The buffer that you're provided with contains the
-  /// full TLS record that contains the certificate. We currently use a fixed
-  /// size buffer for sniffing TLS. However the buffer should be big enough
-  /// that in most cases the certificates won't be truncated. @remark in case
-  /// of truncation this method will not be called.
-  virtual void on_tls_handshake_cert(std::string record) noexcept;
+  /// Called when we finish reassembling a TLS record. This functionality
+  /// is enabled by setting the options_trace|options_trace_tls options.
+  virtual void on_tls_record(TlsRecord record) noexcept;
 
   /// Handles a warning log message.
   virtual void on_warning(std::string message) noexcept;
@@ -310,9 +340,6 @@ class Server {
  private:
   // Worker method that actually implements the socks5 protocol.
   int socks5h_dispatch(int64_t clientfd) noexcept;
-
-  // Checks for buffered data in search for initial TLS handshake.
-  void decode_tls(const std::string &data) noexcept;
 
   // Opaque implementation.
   class Impl;
@@ -580,12 +607,14 @@ class CharStarDeleter {
 using UniqueCharStar = std::unique_ptr<char, CharStarDeleter>;
 
 void Server::on_getdns_success(getdns_dict *reply) noexcept {
+  EMIT_INFO("======= BEGIN GETDNS RESPONSE =======");
   UniqueCharStar string_scope;
   // The returned string must be deleted with free() unless the default malloc
   // function has been replaced. See getdns documentation for more.
   auto s = getdns_pretty_print_dict(reply);
   string_scope.reset(s);
   EMIT_INFO(s);
+  EMIT_INFO("======= END GETDNS RESPONSE =======");
 }
 #endif  // LIBSOCKS5_HAVE_GETDNS
 
@@ -629,8 +658,16 @@ static std::string hexdump(std::string record) noexcept {
   return ss.str();
 }
 
-void Server::on_tls_handshake_cert(std::string record) noexcept {
-  EMIT_INFO(hexdump(std::move(record)));
+void Server::on_tls_record(TlsRecord record) noexcept {
+  std::string dir;
+  switch (record.direction) {
+    case TlsDirection::client_to_server: dir = "CLIENT_TO_SERVER"; break;
+    case TlsDirection::server_to_client: dir = "SERVER_TO_CLIENT"; break;
+    default: return;
+  }
+  EMIT_INFO("====== BEGIN " << dir << " TLS RECORD =======");
+  EMIT_INFO(hexdump(std::move(record.data)));
+  EMIT_INFO("====== END " << dir << " TLS RECORD =======");
 }
 
 // Protected API
@@ -698,6 +735,10 @@ Server::so_resolve_hostname_getdns(
     // of course getdns run many queries and it cannot tell us exactly what
     // went wrong. However we can perhaps have a conversation with them so that
     // we can include in the result dict also information on network errors?
+    //
+    // For diagnostic purposes, it may be interesting to see routing errors. It
+    // could also be interesting to see timeouts. TODO(bassosimone): check
+    // whether the returned error code can tell us that there was a timeout.
     EMIT_WARNING("so_resolve_hostname_getdns: sync DNS query failed");
     return -EIO;
   }
@@ -1003,6 +1044,96 @@ int64_t Server::so_accept(int64_t fd, sockaddr *n, socklen_t *ln) noexcept {
 // Private API
 // ```````````
 
+// Reads the TLS stream and returns TLS records.
+class TlsDecoder {
+ public:
+  // Empty constructor.
+  TlsDecoder() noexcept;
+
+  // Deleted copy constructor.
+  TlsDecoder(const TlsDecoder &) noexcept = delete;
+
+  // Deleted copy assignment.
+  TlsDecoder &operator=(const TlsDecoder &) noexcept = delete;
+
+  // Deleted move constructor.
+  TlsDecoder(TlsDecoder &&) noexcept = delete;
+
+  // Deleted move assignment.
+  TlsDecoder &operator=(TlsDecoder &&) noexcept = delete;
+
+  // Destructor.
+  ~TlsDecoder() noexcept;
+
+  // Reads @p limit bytes from @p base to reassemble a record. @return false
+  // if more data is needed, in which case @p *record will contain an empty
+  // string. @return true when a record is found, in which case @p *record does
+  // contain a copy of the record. @remark This class detaches itself from the
+  // stream when it receives unrecognized messages; use attached() to see
+  // whether it is still attached to the stream.
+  bool on_data(const char *base, uint64_t limit, std::string *record) noexcept;
+
+  // @p return true if we are still attached to stream, false otherwise.
+  bool attached() const noexcept;
+
+ private:
+  std::string buffer_;
+  bool attached_ = true;
+};
+
+TlsDecoder::TlsDecoder() noexcept {}
+
+TlsDecoder::~TlsDecoder() noexcept {}
+
+bool TlsDecoder::on_data(
+    const char *base, uint64_t limit, std::string *record) noexcept {
+  // See https://tools.ietf.org/html/draft-ietf-tls-tls13-28#section-5
+  if (!attached_) return false;
+  if (record == nullptr) return false;
+  record->clear();
+  buffer_ += std::string{base, limit};
+  // The following algorithm is a simplified algorithm on purpose. We wait for
+  // a complete message to be stored on the buffer rather than parsing messages
+  // in chunks. That's less efficient but easier to reason about.
+  if (buffer_.size() < 5) return false;
+  // check for valid TLSPlaintext.type
+  switch (buffer_[0]) {
+    case 20:         // change_cipher_spec
+    case 21:         // alert
+    case 22:         // handshake
+    case 23: break;  // application_data
+    default: attached_ = false; return false;
+  }
+  // Check for meaningful TLSPlaintext.legacy_record_version
+  if (buffer_[1] != 0x03) {
+    attached_ = false;
+    return false;
+  }
+  switch (buffer_[2]) {
+    case 0x00:         // SSLv3
+    case 0x01:         // TLSv1
+    case 0x02:         // TLSv1.1
+    case 0x03:         // TLSv1.2
+    case 0x04: break;  // TLSv1.3 (according to draft SHOULD NOT be used)
+    default: attached_ = false; return false;
+  }
+  // Process TLSPlaintext.length
+  uint16_t length = ((uint8_t)buffer_[3] << 8) + ((uint8_t)buffer_[4]);
+  if (length >= (1 << 14)) {
+    // NOTHING: apparently there are Microsoft products that do not comply
+    // with this part of the spec, hence let us be flexible.
+    //
+    // See <https://www.cisco.com/c/en/us/support/docs/security-vpn/secure-socket-layer-ssl/116181-technote-product-00.html>
+  }
+  assert(buffer_.size() >= 5);
+  if (length > buffer_.size() - 5) return false;  // -EAGAIN
+  *record = buffer_.substr(0, length + 5);
+  buffer_ = buffer_.substr(length + 5);
+  return true;
+}
+
+bool TlsDecoder::attached() const noexcept { return attached_; }
+
 int Server::socks5h_dispatch(int64_t clientfd) noexcept {
   if (clientfd == -1) return -EINVAL;
   {
@@ -1234,17 +1365,19 @@ int Server::socks5h_dispatch(int64_t clientfd) noexcept {
     constexpr uint8_t trace_send = (1 << 1);
     auto forward = [&active, this ](  //
         uint64_t source, uint64_t sink, uint8_t trace) noexcept {
+      TlsDecoder decoder;
       char buffer[131072];
-      constexpr uint64_t tls_snap_size = 262144;  // TODO(bassosimone): ok?
-      std::string tls_stream;
       while (!impl->interrupted) {
         auto n = so_recv(source, buffer, sizeof(buffer));
         if ((trace & trace_receive) != 0) {
           on_recv(source, buffer, sizeof(buffer), n);
-          if (n > 0 && tls_stream.size() < tls_snap_size) {
-            // The snap size is not enforced strictly. It doesn't matter.
-            tls_stream += std::string{buffer, (uint64_t)n};
-            if (tls_stream.size() >= tls_snap_size) decode_tls(tls_stream);
+          if (n > 0 && decoder.attached() &&
+              (impl->settings.options & option_trace_tls) != 0) {
+            TlsRecord record;
+            record.direction = TlsDirection::server_to_client;
+            if (decoder.on_data(buffer, (uint64_t)n, &record.data)) {
+              on_tls_record(std::move(record));
+            }
           }
         }
         if (n <= 0) break;
@@ -1252,11 +1385,17 @@ int Server::socks5h_dispatch(int64_t clientfd) noexcept {
         n = so_sendn(sink, buffer, actual);
         if ((trace & trace_send) != 0) {
           on_send(sink, buffer, actual, n);
+          if (n > 0 && decoder.attached() &&
+              (impl->settings.options & option_trace_tls) != 0) {
+            TlsRecord record;
+            record.direction = TlsDirection::client_to_server;
+            if (decoder.on_data(buffer, (uint64_t)n, &record.data)) {
+              on_tls_record(std::move(record));
+            }
+          }
         }
         if (n <= 0) break;
       }
-      if ((trace & trace_receive) != 0 &&
-          tls_stream.size() < tls_snap_size) decode_tls(tls_stream);
       active -= 1;
     };
     // clang-format off
@@ -1307,56 +1446,6 @@ int Server::socks5h_dispatch(int64_t clientfd) noexcept {
     on_closesocket(serverfd, rv);
   }
   return 0;
-}
-
-void Server::decode_tls(const std::string &data) noexcept {
-  // See <https://www.cisco.com/c/en/us/support/docs/security-vpn/secure-socket-layer-ssl/116181-technote-product-00.html>
-  //
-  // Note that according to the above source Microsoft is known to violate the
-  // maximum record length ((1 << 14) -1) thus we don't enforce limits.
-  //
-  // Decoding of protocols older than SSLv3 is not implemented.
-  uint64_t limit = data.size();
-  const char *base = data.data();
-  for (;;) {
-    std::string record;                  //
-    if (limit < 5) return;               // No space for fixed fields
-    if (base[0] != 0x16) return;         // Not a handshake record
-    record += base[0];                   //
-    if (base[1] != 0x03) return;         // Not TLS v1.x compatible
-    record += base[1];                   //
-    if (base[2] != 0x00 &&               // Not SSLv3
-        base[2] != 0x01 &&               // Not TLSv1
-        base[2] != 0x02 &&               // Not TLSv1.1
-        base[2] != 0x03) {               // Not TLSv1.2+
-      return;                            //
-    }                                    //
-    record += base[2];                   //
-    uint16_t len = 0;                    //
-    len += ((uint8_t)base[3]) << 8;      // Length in network byte order
-    len += ((uint8_t)base[4]) << 0;      // Continuing to read length
-    record += base[3];                   //
-    record += base[4];                   //
-                                         //
-    if ((uintptr_t)base >                // Skip the fixed header
-        UINTPTR_MAX - 5) return;         //
-    base += 5;                           //
-    assert(limit >= 5);                  //
-    limit -= 5;                          //
-    if (len > 0) {                       //
-      if (len > limit) return;           // Truncated
-      record += std::string{base, len};  //
-      if (base[0] == 0x0b) {             // Search for certificate
-        on_tls_handshake_cert(record);   //
-        return;                          // Final state!
-      }                                  //
-      if ((uintptr_t)base >              // Skip the fixed body
-          UINTPTR_MAX - len) return;     //
-      base += len;                       //
-      assert(len <= limit);              //
-      limit -= len;                      //
-    }                                    //
-  }                                      //
 }
 
 #endif  // LIBSOCKS5_NO_INLINE_IMPL
